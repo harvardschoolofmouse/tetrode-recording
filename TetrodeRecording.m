@@ -12,6 +12,7 @@ classdef TetrodeRecording < handle
 		DigitalEvents
 		AnalogIn
 		StartTime
+		SpikeSorterData
 	end
 
 	properties (Transient)
@@ -62,9 +63,19 @@ classdef TetrodeRecording < handle
 		end
 
 		function expName = GetExpName(obj)
-			expName = strsplit(obj.Path, '\');
-			expName = expName{end - 1};
-		end
+%             if ispc
+%                 expName = strsplit(obj.Path, '\');
+% %     			pathstr = strjoin(strsplit(pathstr, '/'), '\');
+%             else
+%                 expName = strsplit(obj.Path, '/');
+% % 				pathstr = [strjoin(strsplit(pathstr, '\'), '/')];
+% 			end
+% 			
+% % 			expName = expName{end - 1};
+%             expName = expName{end};
+            expName = strsplit(obj.Files{1}, {'_', '.'});
+            expName = strjoin(expName(1:3), '_');
+        end
 
 		function startTime = GetStartTime(obj)
 			if isempty(obj.StartTime)
@@ -90,17 +101,37 @@ classdef TetrodeRecording < handle
 		end
 
 		function SelectFiles(obj)
-			[obj.Files, obj.Path, filterindex] = uigetfile({'*.nev; *.ns*; *.ccf', 'Blackrock Files (*.nev, *.ns*, *.ccf)'; '*.rhd', 'Intan RHD2000 Files (*.rhd)'}, 'Select files', 'MultiSelect', 'on');
+			[obj.Files, obj.Path, filterindex] = uigetfile({'*.rhd', 'Intan RHD2000 Files (*.rhd)'; '*.nev; *.ns*; *.ccf', 'Blackrock Files (*.nev, *.ns*, *.ccf)'}, 'Select files', 'MultiSelect', 'on');
 			switch filterindex
 				case 1
-					obj.System = 'Blackrock';
-				case 2
 					obj.System = 'Intan';
+				case 2
+					obj.System = 'Blackrock';
 			end
 				
 		end
 
 		function ReadFiles(obj, varargin)
+            %
+            %   Options:
+            %		SpikeSorterAlign false		logical 	This will specify we want to use the timestamps from SpikeSorter to Grab Waveforms
+            %       ChunkSize:      2           numeric     How many files will be processed together
+            %       Duration:       []          blackrock only. [0, 60] to read 0-60s of data
+            %       SubtractMean:   false       logical
+            %       RemoveTransient:false       logical
+            %       DigitalChannels:'auto'      'auto' or custom: {'Cue', 4; 'Press', 2...}
+            %       AnalogChannel   'auto'      'auto' or custom: {'AccX', 1; 'AccY', 2...}
+            %       Channels        []          numeric, I suppose if you want to specify which channel
+            %       ChannelsOnRig   NaN         numeric
+            %       NumSigmas       2.5         numeric
+            %       NumSigmasReturn 1.25        numeric
+            %       NumSigmasReject 40          numeric
+            %       Direction       'negative'  char
+            %       WaveformWindow  [-0.5,0.5]  numeric
+            %       Rig             4           numeric
+            %       DetectSpikes    true        logical
+            %       DetectEvents    true        logical
+
 			p = inputParser;
 			addOptional(p, 'ChunkSize', 2, @isnumeric);
 			addParameter(p, 'Duration', [], @isnumeric); % [0, 60] to read 0 - 60 seconds of data. For blackrock only
@@ -110,14 +141,16 @@ classdef TetrodeRecording < handle
 			addParameter(p, 'AnalogChannels', 'auto', @(x) iscell(x) || ischar(x)); % 'auto', or custom, e.g. {'AccX', 1; 'AccY', 2; 'AccZ', 3;}
 			addParameter(p, 'Channels', [], @isnumeric);
 			addParameter(p, 'ChannelsOnRig', NaN, @isnumeric);
-			addParameter(p, 'NumSigmas', 4, @isnumeric);
-			addParameter(p, 'NumSigmasReturn', [], @isnumeric);
-			addParameter(p, 'NumSigmasReject', [], @isnumeric);
+			addParameter(p, 'NumSigmas', 2.5, @isnumeric); % Spike detection threshold = (this*sigma*direction). Sigma is estimated noise standard deviation.
+			addParameter(p, 'NumSigmasReturn', 1.25, @isnumeric); % [] to disable. Waveform must return to this*sigma*direction after crossing threshold, helps remove noisy periods with non-zero baseline.
+			addParameter(p, 'NumSigmasReject', 40, @isnumeric); % [] to disable. Reject huge waveforms that exceed this many sigmas in either direction
 			addParameter(p, 'Direction', 'negative', @ischar);
 			addParameter(p, 'WaveformWindow', [-1.25, 1.25], @isnumeric);
-			addParameter(p, 'Rig', 1, @isnumeric);
+			addParameter(p, 'Rig', 4, @isnumeric);
 			addParameter(p, 'DetectSpikes', true, @islogical);
 			addParameter(p, 'DetectEvents', true, @islogical);
+            addParameter(p, 'SpikeSorterAlign', false, @islogical) % if this is selected, we'll instead align to SpikeSorter timepoints
+			addParameter(p, 'SpikeSorterCSV', [], @isstruct) % put in the units structure from SpikeSorter's CSV
 			parse(p, varargin{:});
 			chunkSize 		= p.Results.ChunkSize;
 			duration 		= p.Results.Duration;
@@ -135,35 +168,87 @@ classdef TetrodeRecording < handle
 			rig 			= p.Results.Rig;
 			detectSpikes	= p.Results.DetectSpikes;
 			detectEvents	= p.Results.DetectEvents;
+            spikeSorterAlign = p.Results.SpikeSorterAlign;
+			spikeSorterCSV  = p.Results.SpikeSorterCSV;
 
+            % We will set the files in our iv and then decide how many to
+            % process together:
 			files = obj.Files;
 			numChunks = ceil(length(files)/chunkSize);
 
 			switch lower(obj.System)
 				case 'intan'
 					for iChunk = 1:numChunks
+                        % this announces the text out loud!
 						TetrodeRecording.TTS(['Processing chunk ', num2str(iChunk), '/', num2str(numChunks), ':\n']);
+
+                        % this uses the Intan > Matlab loader from their
+                        % website, which LFH put into the code here
 						obj.ReadIntan(obj.Files((iChunk - 1)*chunkSize + 1:min(iChunk*chunkSize, length(obj.Files))))
-% 						obj.GenerateChannelMap('HeadstageType', 'Intan');
+                        % LFH stores the variables of interest from the
+                        % Intan loader in 
+                        %       obj.Amplifier -- spike channels
+                        %       obj.BoardDigIn -- digital channels
+                        %       obj.BoardADC -- ADC channels
+                        %       obj.FrequencyParameters -- the filters Intan applied, etc                        
+
+% 						obj.GenerateChannelMap('HeadstageType', 'Intan'); %	not implemented
+% 						
 						if substractMean
-							obj.SubstractMean();
+							obj.SubstractMean(); % takes the nanmean across all data in 
+                            % this file and subtracts it from all channels. though NB, 
+                            % this is only for this minute of data!
 						end
 						if removeTransient
-							obj.RemoveTransient();
+							obj.RemoveTransient(); % this guy anticipates when there is a lick or press
+                            % artifact and sets signal to zero here to
+                            % exclude it. Probably we'd rather see it for
+                            % now, so this is set to false.
+                            % RemoveTransient(obj, digChannel, dilate,
+                            % dilateSize): LFH uses channels 1 and 2 as his
+                            % touch/lick inputs. We would need to customize
+                            % this. Dilate default is true -- this will
+                            % apply a mask of zeros to any lick-touch
+                            % positive time period--then extend this by the
+                            % dilateSize, which default is 30, which
+                            % corresponds to 15 ms on either side of the
+                            % lick (should verify this before use, not clear to me this is what really happens)
 						end
 						if isempty(channels)
-% 							channels = obj.MapChannel_RawToTetrode([obj.Amplifier.Channels.NativeOrder] + 1);
-                            channels = [obj.Amplifier.Channels.NativeOrder] + 1;
+% 							channels =
+% 							obj.MapChannel_RawToTetrode([obj.Amplifier.Channels.NativeOrder] +
+% 							1); %NOT IMPLEMENTED
+                            channels = [obj.Amplifier.Channels.NativeOrder] + 1; % appends a one because the NativeOrder field indexes from zero
                         end
-%                         if strcmpi(digitalChannels, 'auto')
-%                             digitalChannels = {'Cue', 1; 'Reward', 2; 'Lick', 3; 'Press', 4; 'LED', 5; 'Opto', 6};
-%                         end
-						obj.GetDigitalData('ChannelLabels', digitalChannels, 'Append', iChunk > 1);
-% 						obj.GetAnalogData('ChannelLabels', analogChannels, 'Append', iChunk > 1);
-						obj.SpikeDetect(channels, 'NumSigmas', numSigmas, 'NumSigmasReturn', numSigmasReturn, 'NumSigmasReject', numSigmasReject, 'WaveformWindow', waveformWindow, 'Direction', direction, 'Append', iChunk > 1);
-						obj.ClearCache();
-					end
-					obj.GetDigitalEvents(true);
+                        if ~spikeSorterAlign
+	                        % this pulls the channel names and such from the
+	                        % Intan, nice! Puts that info in obj.DigitalEvents.
+	                        % Also makes Data a sparse double
+							obj.GetDigitalData('ChannelLabels', digitalChannels, 'Append', iChunk > 1);
+	                        % if we had analog data, we might use the below.
+	                        % But I'm using CED for this, and LFH may not have
+	                        % finished this function
+	% 						obj.GetAnalogData('ChannelLabels', analogChannels, 'Append', iChunk
+	% 						> 1); NOT IMPLEMENTED
+							obj.SpikeDetect(channels,...
+	                            'NumSigmas', numSigmas,...
+	                            'NumSigmasReturn', numSigmasReturn,...
+	                            'NumSigmasReject', numSigmasReject,...
+	                            'WaveformWindow', waveformWindow,...
+	                            'Direction', direction,...
+	                            'Append', iChunk > 1);
+						elseif spikeSorterAlign
+							% here we just want to pull out the waveforms corresponding to our timepoints in spikesorter
+							obj.GetSpikeSorterWaveforms(spikeSorterCSV,...
+                                'WaveformWindow', waveformWindow,...
+	                            'Append', iChunk > 1);
+
+						end
+						warning('need to clear cache') % obj.ClearCache();
+                    end
+                    if ~spikeSorterAlign
+					    obj.GetDigitalEvents(true);
+                    end
 				case 'blackrock'
 					if ~detectEvents
 						digitalChannels = {};
@@ -200,7 +285,7 @@ classdef TetrodeRecording < handle
 						obj.ClearCache();
 					end
 			end
-			obj.GetStartTime();
+			obj.GetStartTime(); % this is for blackrock...
 		end
 
 		function ReadBlackrock(obj, varargin)
@@ -706,7 +791,7 @@ classdef TetrodeRecording < handle
 			iSample.BoardADC = 0;
 			for iFile = 1:length(files)
 				obj.Amplifier.Timestamps(1, iSample.Amplifier + 1:iSample.Amplifier + size(objTemp(iFile).Amplifier.Timestamps, 2)) = objTemp(iFile).Amplifier.Timestamps;
-                [~, ia, ib] = intersect(1:nChannels, [objTemp(iFile).Amplifier.Channels.NativeOrder]);
+                [~, ia, ib] = intersect(1:nChannels, [objTemp(iFile).Amplifier.Channels.NativeOrder]+1);
 				obj.Amplifier.Data(ia, iSample.Amplifier + 1:iSample.Amplifier + size(objTemp(iFile).Amplifier.Timestamps, 2)) = objTemp(iFile).Amplifier.Data(ib, :);
 				obj.BoardDigIn.Timestamps(1, iSample.BoardDigIn + 1:iSample.BoardDigIn + size(objTemp(iFile).BoardDigIn.Timestamps, 2)) = objTemp(iFile).BoardDigIn.Timestamps;
 				obj.BoardDigIn.Data(:, iSample.BoardDigIn + 1:iSample.BoardDigIn + size(objTemp(iFile).BoardDigIn.Timestamps, 2)) = objTemp(iFile).BoardDigIn.Data;
@@ -886,10 +971,10 @@ classdef TetrodeRecording < handle
 			append 			= p.Results.Append;
 
 			TetrodeRecording.TTS('	Detecting spikes:\n');
-			sampleRate = obj.FrequencyParameters.AmplifierSampleRate/1000;
+			sampleRate = obj.FrequencyParameters.AmplifierSampleRate/1000; % in kHz
 
 			for iChannel = channels
-				sigma = nanmedian(abs(obj.Amplifier.Data(iChannel, :)))/0.6745;
+				sigma = nanmedian(abs(obj.Amplifier.Data(iChannel, :)))/0.6745; % gets sometime like the median std
 				threshold = numSigmas*sigma;
 				switch lower(directionMode)
 					case 'negative'
@@ -901,7 +986,7 @@ classdef TetrodeRecording < handle
 					otherwise
 						error(['Unrecognized spike detection mode ''', directionMode, '''.'])
 				end
-				tic, TetrodeRecording.TTS(['		Channel ', num2str(iChannel), ' (', num2str(char(952)), ' = ', num2str(numSigmas), num2str(char(963)), ' = ', num2str(direction*threshold), ')...']);
+				tic, TetrodeRecording.TTS(['		Channel ', num2str(iChannel), ' (', num2str(char(952)), ' = ', num2str(numSigmas), ' | ', num2str(char(963)), ' = ', num2str(direction*threshold), ')...']);
 				
 				% Find spikes
 				[~, sampleIndex] = findpeaks(double(direction*obj.Amplifier.Data(iChannel, :)), 'MinPeakHeight', threshold, 'MinPeakProminence', threshold);
@@ -909,7 +994,7 @@ classdef TetrodeRecording < handle
 				% Extract waveforms
 				[waveforms, t] = obj.GetWaveforms(iChannel, waveformWindow, sampleIndex, 'IndexType', 'SampleIndex');
 
-				% Align waveforms to peak
+				% Align waveforms to peak. Each has 31 samples, this pulls out thousands of waveforms, including noise!
 				numWaveforms = size(waveforms, 1);
 				i = sampleRate*t;
 				[~, maxIndex] = max(direction*waveforms, [], 2);
@@ -968,6 +1053,84 @@ classdef TetrodeRecording < handle
 				TetrodeRecording.TTS(['Done(', num2str(numWaveforms), ' waveforms, ', num2str(toc, '%.2f'), ' seconds).\n'])
 			end
 		end
+		% Detect spike by simple thresholding
+		function GetSpikeSorterWaveforms(obj, SpikeSorterData, varargin)
+            % SpikeSorterData is the imported CSV: columns: times and
+            % channels
+			% obj.GetSpikeSorterWaveforms('SpikeSorterData', units)
+			% based on the SpikeDetect function. Must be called from workspace with Amplifier field containing raw ephys data
+			p = inputParser;
+			addRequired(p, 'SpikeSorterData', @isstruct);
+			addParameter(p, 'Clusters', [], @isnumeric);
+			addParameter(p, 'WaveformWindow', [-0.5, 0.5], @isnumeric);
+			addParameter(p, 'Append', false, @islogical);
+			parse(p, SpikeSorterData, varargin{:});
+			units 			= p.Results.SpikeSorterData;
+			clusters 		= p.Results.Clusters;
+			waveformWindow 	= p.Results.WaveformWindow;
+			append 			= p.Results.Append;
+
+			if isempty(clusters)
+				clusters = 1:size(units, 2);
+			else
+				units = units(clusters);
+			end
+
+			% we want to keep the cluster structure the same but add the waveforms to it.
+
+			TetrodeRecording.TTS('	Finding waveforms for each cluster in SpikeSorter data:\n');
+			sampleRate = obj.FrequencyParameters.AmplifierSampleRate/1000; % in kHz
+
+			for iCluster = clusters
+				tic, TetrodeRecording.TTS(['		Cluster ', num2str(iCluster), '...']);
+				
+				% find all the indicies where the timestamp in cluster struct (units) matches the opened ephys file.
+				min_time = obj.Amplifier.Timestamps(1)-0.000001;
+				max_time = obj.Amplifier.Timestamps(end)+0.000001;
+                % trim units times over the max...
+                keepIdx = units(iCluster).times > min_time & units(iCluster).times < max_time;
+                units(iCluster).times = units(iCluster).times(keepIdx);
+                units(iCluster).channels = units(iCluster).channels(keepIdx);
+				% what are the timepoints in the cluster? find all within range...
+				clustertimes = units(iCluster).times;
+                % find the channels each clust in this time range...
+				channels = unique(units(iCluster).channels);
+				% in principle, the cluster times should match the original file...
+				sampleIndex = find(ismembertol(obj.Amplifier.Timestamps, clustertimes,0.0000001));
+
+				% Extract waveforms
+				for iChannel = 1:numel(channels)
+					ch = channels(iChannel);
+					idx = units(iCluster).channels == ch;
+
+					[waveforms, t, timestamps, sampleIdx] = obj.GetWaveforms(ch, waveformWindow, sampleIndex(idx), 'IndexType', 'SampleIndex');
+					% Double data so we can do divisions and stuff
+					if ~isa(waveforms, 'double'), waveforms = double(waveforms(iChannel));end
+
+					% Store data
+					if ~append
+						obj.SpikeSorterData(iCluster).Unit(iChannel).Channels = ch;
+						obj.SpikeSorterData(iCluster).Unit(iChannel).SampleIndex = sampleIdx;
+						obj.SpikeSorterData(iCluster).Unit(iChannel).Timestamps = timestamps;
+						obj.SpikeSorterData(iCluster).Unit(iChannel).Waveforms = waveforms;
+						obj.SpikeSorterData(iCluster).Unit(iChannel).WaveformTimestamps = t;
+					else
+						% find where this channel was before
+						chi = find([obj.SpikeSorterData(iCluster).Unit(iChannel).Channels] == ch);
+						if isempty(chi)
+							chi = numel([obj.SpikeSorterData(iCluster).Unit(iChannel).Channels]) + 1;
+						end
+						obj.SpikeSorterData(iCluster).Unit(chi).Channels = ch;
+						obj.SpikeSorterData(iCluster).Unit(chi).SampleIndex = [obj.SpikeSorterData(iCluster).Unit(chi).SampleIndex, sampleIndex + length(obj.DigitalEvents.Timestamps)];
+						obj.SpikeSorterData(iCluster).Unit(chi).Timestamps = [obj.SpikeSorterData(iCluster).Unit(chi).Timestamps, timestamps];
+						obj.SpikeSorterData(iCluster).Unit(chi).Waveforms = [obj.SpikeSorterData(iCluster).Unit(chi).Waveforms; waveforms];
+					end
+				end
+
+				TetrodeRecording.TTS(['Done(' num2str(toc, '%.2f'), ' seconds).\n'])
+			end
+		end
+
 
 		function GetAnalogData(obj, varargin)
 			p = inputParser;
@@ -1082,8 +1245,13 @@ classdef TetrodeRecording < handle
 			obj.Amplifier = [];
 			obj.BoardDigIn = [];
 			obj.BoardADC = [];
-			mem = memory();
-			TetrodeRecording.TTS(['Cached data cleared. System memory: ', num2str(round(mem.MemUsedMATLAB/1024^2)), ' MB used (', num2str(round(mem.MemAvailableAllArrays/1024^2)), ' MB available).\n']);
+			if ispc
+				mem = memory();
+                TetrodeRecording.TTS(['Cached data cleared. System memory: ', num2str(round(mem.MemUsedMATLAB/1024^2)), ' MB used (', num2str(round(mem.MemAvailableAllArrays/1024^2)), ' MB available).\n']);
+            else
+                TetrodeRecording.TTS('Cached data cleared. MacOS unable to report System memory. But we haven'' crashed and burned yet..! Nbd, dude!\n');
+			end
+			
 		end
 
 		% SpikeSort: PCA & Cluster
@@ -1239,6 +1407,9 @@ classdef TetrodeRecording < handle
 		end
 
 		function FeatureExtract(obj, channels, varargin)
+			% 
+			% 	Can currently use either wavelettransform or pca to extract features
+			% 
 			p = inputParser;
 			addRequired(p, 'Channels', @isnumeric);
 			addParameter(p, 'WaveformWindow', [], @isnumeric);
@@ -1359,6 +1530,10 @@ classdef TetrodeRecording < handle
 		end
 
 		function Cluster(obj, channels, varargin)
+            %
+            %   Method: kmeans, spc (superparamagnetic), gaussian (Gaussian
+            %   mixture model)
+            %
 			p = inputParser;
 			addRequired(p, 'Channels', @isnumeric);
 			addParameter(p, 'Method', 'kmeans', @ischar);
@@ -1380,7 +1555,7 @@ classdef TetrodeRecording < handle
 				case 'spc'
 					methodDisplayName = 'superparamagnetic';
 				otherwise
-					error('Unrecognized clustering method. Must be ''kmeans'', ''gaussian'', or ''SPC''.')			
+					error('Unrecognized clustering method. Must be ''kmeans'', ''gaussian'', or ''spc''.')			
 			end			
 			tic, TetrodeRecording.TTS(['	Clustering (', methodDisplayName, '):\n']);
 			for iChannel = channels
@@ -1416,7 +1591,7 @@ classdef TetrodeRecording < handle
 						[classesSelected, obj.Spikes(iChannel).Cluster.Stats] = obj.SPC(iChannel, 'Dimension', thisDimension, 'SelectedWaveforms', selected);
 				end
 
-				if nnz(selected) ~= numWaveforms
+				if nnz(selected) ~= numWaveforms % if numbernonzeromatrixelements ~= numWaveforms
 					classesUntouched = obj.Spikes(iChannel).Cluster.Classes(~selected);
 					numClassesTotal = length(unique(classesUntouched)) + length(unique(classesSelected));
 					map = setdiff(1:numClassesTotal, classesUntouched);
@@ -1455,7 +1630,7 @@ classdef TetrodeRecording < handle
 				dimension = size(feature, 2);
 			end
 
-			feature = feature(selectedWaveforms, 1:dimension);
+			feature = feature(selectedWaveforms, 1:dimension); % this is pulling the weights for each PC coeff for each waveform on this channel
 
 			warning('off')
 
@@ -1465,7 +1640,7 @@ classdef TetrodeRecording < handle
 			else
 				stats = [];
 			end
-			classes = kmeans(feature, numClusters, 'Replicates', 10);
+			classes = kmeans(feature, numClusters, 'Replicates', 10); % runs kmeans with 10 replicates with goal of 3 clusters. I guess it runs with clustering variously in stochastic fashion until ends with 3 clusters and picks the best out of these
 
 			warning('on')
 			varargout = {classes, stats};
@@ -2489,7 +2664,7 @@ classdef TetrodeRecording < handle
 
 		function PlotAllChannels(obj, varargin)
 			p = inputParser;
-			addParameter(p, 'Channels', [], @isnumeric);
+			addParameter(p, 'Channels', [], @isnumeric); % plots all
 			addParameter(p, 'PercentShown', 5, @isnumeric); % What percentage of waveforms are plotted (0 - 100)
 			addParameter(p, 'MaxShown', 200, @isnumeric);
 			addParameter(p, 'Fontsize', 8, @isnumeric);
@@ -2529,14 +2704,16 @@ classdef TetrodeRecording < handle
             m6 = uimenu(cm, 'Text', 'Execute All', 'MenuSelectedFcn', @obj.PlotAllChannels_OnExecuteAll);
             cm.ContextMenuOpeningFcn = {@obj.PlotAllChannels_OnContextMenuOpened, m1, m2, m3, m4};
             
-            
+            xsubplots = 16;
+            ysubplots = numel(channels)/xsubplots;
+
 			for iChannel = channels
 				if isempty(obj.Spikes(iChannel).Waveforms)
 					continue
 				end
 
 
-				hAxes(iChannel)	= subplot(8, 16, iChannel);
+				hAxes(iChannel)	= subplot(ysubplots, xsubplots, iChannel);
                 hAxes(iChannel).ContextMenu = cm;
                 obj.PlotAllChannels_PlotSingle(hAxes(iChannel), iChannel, p)
 			end
@@ -4101,7 +4278,9 @@ classdef TetrodeRecording < handle
 					set([h.PCA, h.Raster], 'Box', 'off', 'LineWidth', 0.5, 'XColor', 'k', 'YColor', 'k');
 					switch evnt.Button
 						case 1 % LMB - hoop mode
-							[x, y] = getline(hAxes);
+							hh = drawline(hAxes);%[x, y] = drawline(hAxes);
+                            x = hh.Position(:,1);
+                            y = hh.Position(:,2);
 							hoop = [x, y];
 							if size(hoop, 1) == 2
 								selection = obj.GetSpikesByHoop(iChannel, hoop, 'Clusters', h.Figure.UserData.SelectedClusters, 'SampleIndex', h.Figure.UserData.SelectedSampleIndex);
@@ -4119,7 +4298,10 @@ classdef TetrodeRecording < handle
 					end
 				case 'feature'
 					set([h.Waveform, h.Raster], 'Box', 'off', 'LineWidth', 0.5, 'XColor', 'k', 'YColor', 'k');
-					[x, y] = getline(hAxes, 'closed');
+% 					[x, y] = drawline(hAxes);%, 'closed');
+                    hh = drawpolygon(hAxes);%[x, y] = drawline(hAxes);
+                    x = hh.Position(:,1);
+                    y = hh.Position(:,2);
 					polygon = [x, y];
 					if size(polygon, 1) >= 3
 						selection = obj.GetSpikesByFeature(iChannel, polygon, 'Clusters', h.Figure.UserData.SelectedClusters, 'SampleIndex', h.Figure.UserData.SelectedSampleIndex);
@@ -4128,7 +4310,8 @@ classdef TetrodeRecording < handle
 					end
 				case 'raster'
 					set([h.Waveform, h.PCA], 'Box', 'off', 'LineWidth', 0.5, 'XColor', 'k', 'YColor', 'k');
-					rect = getrect(hAxes);
+					rect = drawrectangle(hAxes);
+                    rect = rect.Position;
 					if nnz(rect(3:4)) == 2
 						pp = hAxes.UserData.PlotParams;
 						switch lower(pp.AlignTo)
@@ -4572,6 +4755,62 @@ classdef TetrodeRecording < handle
             thisRefCluster = max(obj.Spikes(thisChannel).Cluster.Classes); % Use the last cluster is 'noise'/reference cluster
 
             varargout = {thisChannel, thisCluster, thisRefCluster};
+		end
+		function getUnitsOnChannel(obj, ch)
+			% 	AH fxn 4/4/23
+			% 
+			% 	Assumes we have data in the SpikeSorterData field. 
+			%	We will grab all the units that have spikes on the input channel here
+			%	This will map them and allow us to look at them...
+			%
+
+			% start by finding out how much Intan data is in LFH obj. 
+			LFHtimestamps = obj.Spikes(ch).Timestamps;
+			maxtime = max(LFHtimestamps);
+
+			% find all the units with ch data...
+			units_onch = [];
+			SS_timestamps = {};
+			for ii = 1:numel(obj.SpikeSorterData)
+			    if ~isempty(obj.SpikeSorterData(ii).Unit) && sum(ismember([obj.SpikeSorterData(ii).Unit.Channels], ch))
+			        units_onch(end+1) = ii;
+			        % now get these timestamps...
+			        SS_timestamps{end+1} = obj.SpikeSorterData(ii).Unit.Timestamps;
+			        % and plot them...e
+			        tsinrange = obj.SpikeSorterData(ii).Unit.Timestamps<=maxtime;
+			        SS_timestamps_plot = obj.SpikeSorterData(ii).Unit.Timestamps(tsinrange);
+			        [f2,ax2] = makeStandardFigure(4, [1,4]);
+			        % plot LFH class 1:
+			        spikeIDs = obj.Spikes(ch).Cluster.Classes==1;
+                    if sum(spikeIDs) >= 1
+			            plot(ax2(1),obj.Spikes(ch).WaveformTimestamps, obj.Spikes(ch).Waveforms(spikeIDs(1:10:end),:));
+			            title(ax2(1), 'LFH class 1')
+			            xlim(ax2(1),[-0.5,0.5])
+                    end
+                    spikeIDs = obj.Spikes(ch).Cluster.Classes==2;
+                    if sum(spikeIDs) >= 1
+			            plot(ax2(2),obj.Spikes(ch).WaveformTimestamps, obj.Spikes(ch).Waveforms(spikeIDs(1:10:end),:));
+			            title(ax2(2), 'LFH class 2')
+			            xlim(ax2(2),[-0.5,0.5])
+                    end
+                    spikeIDs = obj.Spikes(ch).Cluster.Classes==3;
+                    if sum(spikeIDs) >= 1
+			            
+			            plot(ax2(3),obj.Spikes(ch).WaveformTimestamps, obj.Spikes(ch).Waveforms(spikeIDs(1:10:end),:));
+			            title(ax2(3), 'LFH class 3')
+			            xlim(ax2(3),[-0.5,0.5])
+                    end
+			        plot(ax2(4),obj.SpikeSorterData(ii).Unit.WaveformTimestamps, obj.SpikeSorterData(ii).Unit.Waveforms(tsinrange(1:10:end),:));
+			        title(ax2(4), ['SS, unit# ' num2str(ii)])
+			        xlim(ax2(4),[-0.5,0.5])
+			        yy = ylim(ax2(4));
+			        ylim(ax2(1:3), yy)
+			    end
+			end
+
+			obj.UserData.SpikeSorterMap(ch).Channel = ch;
+			obj.UserData.SpikeSorterMap(ch).units_onch = units_onch;
+			obj.UserData.SpikeSorterMap(ch).SS_spiketimes = SS_timestamps;
 		end
 	end
 
@@ -5951,11 +6190,11 @@ classdef TetrodeRecording < handle
 			if nargin < 2
 				speak = false;
 			end
-			% if speak
-			% 	txt = strsplit(txt, '\');
-			% 	txt = txt{1};
-			% 	tts(txt);
-			% end
+			if speak
+				txt = strsplit(txt, '\');
+				txt = txt{1};
+				tts(txt);
+			end
 		end
 
 		function RandomWords()
